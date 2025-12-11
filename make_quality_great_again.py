@@ -122,17 +122,11 @@ def get_haut_histo(histo, seuil_haut):
 			return i
 
 #############################################################################################################################	
-def calculate_cdf_percent(pixel_array, percentile, no_data):
-	# Exclude the no-data value and NaN, then calculate the percentile value of the CDF
-	# Filtrer les valeurs invalides (no-data et NaN)
-	# ~np.isnan(pixel_array) permet d'exclure des pixels qui auraient la valeur NaN ('Not a Number')
-	# Même si on code le no_data en entrée et en sortie avec la valeur de l'utilisateur,
-	# certaines opérations numériques (division par zéro, etc.) peuvent générer des NaN à l'intérieur du traitement/intermédiaires.
-	# On continue donc à filtrer les NaN pour ne jamais les considérer comme valeurs valides dans les fenêtres de calcul de percentile.
-	valid_mask = (pixel_array != no_data) & ~np.isnan(pixel_array)
-	pixel_array = pixel_array[valid_mask]
+def calculate_cdf_percent(pixel_array, percentile):
+	# Exclude the no-data value and calculate the 5% value of the CDF
+	pixel_array = pixel_array[pixel_array != -9999]
 	if len(pixel_array) == 0:
-		return no_data  # Return no-data value if the window only contains no-data values
+		return -9999  # Return no-data value if the window only contains no-data values
 	sorted_pixels = np.sort(pixel_array)
 	index_5_percent = int(np.ceil(percentile * len(sorted_pixels))) - 1
 	return sorted_pixels[max(0, index_5_percent)]
@@ -150,26 +144,15 @@ def calculate_cdf_percent(pixel_array, percentile, no_data):
 	
 #############################################################################################################################	
 def process_image(image,dl,no_data,percentile):
-	# Convertir les NaN en no_data pour uniformiser
-	image = np.where(np.isnan(image), no_data, image)
-	
 	# Pad image to handle the borders
 	padded_image = np.pad(image, dl, mode='constant', constant_values=no_data)
-	
-	# Use generic_filter from scipy.ndimage to apply the function over a (2*dl+1)x(2*dl+1) window
-	# calculate_cdf_percent filtre automatiquement les no_data
-	result = generic_filter(padded_image, lambda x: calculate_cdf_percent(x, percentile, no_data), size=(2*dl+1, 2*dl+1), mode='constant', cval=no_data)
-	
+	# Use generic_filter from scipy.ndimage to apply the function over a 101x101 window
+	result = generic_filter(padded_image, lambda x: calculate_cdf_percent(x, percentile), size=(2*dl+1, 2*dl+1), mode='constant', cval=no_data)
 	# Crop the padded area off the result
-	result_cropped = result[dl:-dl, dl:-dl]
-	
-	# S'assurer que les valeurs invalides sont bien à no_data (déjà fait par calculate_cdf_percent, mais on double-vérifie)
-	result_cropped = np.where(np.isnan(result_cropped), no_data, result_cropped)
-	
-	return result_cropped
+	return result[dl:-dl, dl:-dl]
 	
 #############################################################################################################################	
-def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename, no_data):
+def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename):
     # Calculer la valeur absolue de l'image
     abs_image = np.abs(image)
     
@@ -177,15 +160,11 @@ def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename,
     with rasterio.open(src_filename) as src:
         metadata = src.meta.copy()  # Copiez les métadonnées de l'image source
         
-    # Convertir les NaN en no_data
-    abs_image = np.where(np.isnan(abs_image), no_data, abs_image)
-    
     # Mettez à jour les métadonnées avec les nouvelles dimensions si nécessaire
     metadata['height'], metadata['width'] = abs_image.shape
     metadata['dtype'] = abs_image.dtype  # Assurez-vous que le type de données correspond à l'image de sortie
-    metadata['nodata'] = no_data  # Définir explicitement le nodata à la valeur de l'utilisateur
     
-    # Utilisez les métadonnées copiées pour écrire l'image dans un fichier .tif
+    # Utilisez lechem_xings métadonnées copiées pour écrire l'image dans un fichier .tif
     with rasterio.open(output_filename, 'w', **metadata) as dst:
         dst.write(abs_image, 1)  # Écrit l'image dans la première bande en assumant qu'il s'agit d'une image à une seule bande
         
@@ -306,7 +285,7 @@ def create_weight_image_vertical(overlap_bounds, target_shape):
 	return weights
 
 #################################################################################################### 
-def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_bounds, output_path, no_data):
+def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_bounds, output_path):
 	"""Fait la moyenne pondérée de deux dalles dans la zone de recouvrement.
 	Formule: I1*I2 + I3*I4 où I1=dalle1, I2=poids1, I3=dalle2, I4=poids2
 	L'image de sortie a les bounds définis par overlap_bounds (équivalent à -cg:)."""
@@ -323,23 +302,18 @@ def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_b
 		if weight1.shape != data1.shape or weight2.shape != data1.shape:
 			raise ValueError(f"Taille des poids incompatible: poids1={weight1.shape}, poids2={weight2.shape}, données={data1.shape}")
 		
-		# Gérer les no-data - normaliser à la valeur de l'utilisateur
-		no_data1 = src1.nodata if src1.nodata is not None else no_data
-		no_data2 = src2.nodata if src2.nodata is not None else no_data
-		no_data_out = no_data  # Utiliser la valeur de l'utilisateur comme nodata de sortie
+		# Gérer les no-data
+		no_data1 = src1.nodata if src1.nodata is not None else -9999
+		no_data2 = src2.nodata if src2.nodata is not None else -9999
 		
-		# Convertir les nodata des deux images en no_data_out pour uniformiser
-		data1 = np.where((data1 == no_data1) | np.isnan(data1), no_data_out, data1)
-		data2 = np.where((data2 == no_data2) | np.isnan(data2), no_data_out, data2)
-		
-		# Masques pour les valeurs valides (exclure no_data et NaN)
-		valid1 = (data1 != no_data_out) & ~np.isnan(data1)
-		valid2 = (data2 != no_data_out) & ~np.isnan(data2)
+		# Masques pour les valeurs valides
+		valid1 = (data1 != no_data1) & ~np.isnan(data1)
+		valid2 = (data2 != no_data2) & ~np.isnan(data2)
 		
 		# Calculer la moyenne pondérée
-		result = np.full_like(data1, no_data_out, dtype=np.float32)
+		result = np.full_like(data1, no_data1, dtype=np.float32)
 		
-		# Cas où les deux valeurs sont valides : moyenne pondérée
+		# Cas où les deux valeurs sont valides
 		both_valid = valid1 & valid2
 		result[both_valid] = data1[both_valid] * weight1[both_valid] + data2[both_valid] * weight2[both_valid]
 		
@@ -350,9 +324,6 @@ def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_b
 		# Cas où seule la dalle2 est valide
 		only2 = valid2 & ~valid1
 		result[only2] = data2[only2]
-		
-		# S'assurer qu'il n'y a pas de NaN dans le résultat
-		result = np.where(np.isnan(result), no_data_out, result)
 		
 		# Créer le transform pour l'image de sortie avec les bounds de recouvrement
 		# overlap_bounds = (left, bottom, right, top)
@@ -375,7 +346,7 @@ def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_b
 			'width': width,
 			'transform': transform,
 			'dtype': result.dtype,
-			'nodata': no_data_out,
+			'nodata': no_data1,
 			'compress': 'lzw'
 		})
 		
@@ -384,12 +355,9 @@ def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_b
 			dst.write(result, 1)
 
 #################################################################################################### 
-def assemble_horizontal(image_paths, output_path, no_data):
-	"""Assemble des images de gauche à droite. 
-	Les pixels suivants écrasent les précédents en cas de recouvrement.
-	IMPORTANT: Les pixels no-data ne remplacent PAS les pixels valides existants."""
+def assemble_horizontal(image_paths, output_path):
+	"""Assemble des images de gauche à droite. Les pixels suivants écrasent les précédents en cas de recouvrement."""
 	from rasterio.merge import merge
-	from rasterio.warp import reproject, Resampling
 	
 	# Trier les images par leur position X (left) pour garantir l'ordre de gauche à droite
 	image_bounds = []
@@ -405,87 +373,17 @@ def assemble_horizontal(image_paths, output_path, no_data):
 	srcs = [rasterio.open(path) for path in sorted_paths]
 	
 	try:
-		# Calculer les bounds de toutes les images
-		all_bounds = [src.bounds for src in srcs]
-		minx = min(b.left for b in all_bounds)
-		miny = min(b.bottom for b in all_bounds)
-		maxx = max(b.right for b in all_bounds)
-		maxy = max(b.top for b in all_bounds)
-		
-		# Utiliser le transform et la résolution de la première image
-		first_src = srcs[0]
-		transform = first_src.transform
-		width = int((maxx - minx) / abs(transform.a))
-		height = int((maxy - miny) / abs(transform.e))
-		
-		# Créer le transform final
-		from rasterio.transform import from_bounds
-		out_trans = from_bounds(minx, miny, maxx, maxy, width, height)
-		
-		# Créer un array pour la mosaïque, initialisé avec no-data
-		no_data_value = no_data
-		mosaic = np.full((1, height, width), no_data_value, dtype=np.float32)
-		
-		# Assembler les images une par une, de gauche à droite
-		# Seuls les pixels VALIDES remplacent les précédents
-		for src in srcs:
-			# Lire les données de cette image
-			data = src.read(1).astype(np.float32)
-			
-			# Normaliser les no-data
-			src_nodata = src.nodata if src.nodata is not None else no_data_value
-			data = np.where((data == src_nodata) | np.isnan(data), no_data_value, data)
-			
-			# Calculer la fenêtre de cette image dans la mosaïque
-			window = rasterio.windows.from_bounds(
-				src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top,
-				out_trans
-			)
-			
-			# Calculer les indices (arrondir pour éviter les problèmes d'alignement)
-			row_start = max(0, int(round(window.row_off)))
-			row_end = min(height, row_start + data.shape[0])
-			col_start = max(0, int(round(window.col_off)))
-			col_end = min(width, col_start + data.shape[1])
-			
-			# Ajuster data si nécessaire
-			data_rows = row_end - row_start
-			data_cols = col_end - col_start
-			
-			if data_rows > 0 and data_cols > 0 and data_rows <= data.shape[0] and data_cols <= data.shape[1]:
-				# Extraire la partie de data qui correspond
-				data_cropped = data[:data_rows, :data_cols]
-				
-				# Extraire la région correspondante dans la mosaïque
-				mosaic_region = mosaic[0, row_start:row_end, col_start:col_end]
-				
-				# Masque pour les pixels valides de la nouvelle image
-				valid_new = (data_cropped != no_data_value) & ~np.isnan(data_cropped)
-				
-				# Masque pour les pixels no-data existants dans la mosaïque
-				existing_nodata = (mosaic_region == no_data_value) | np.isnan(mosaic_region)
-				
-				# Masque pour les pixels valides existants dans la mosaïque
-				existing_valid = ~existing_nodata
-				
-				# Remplacer seulement si :
-				# - Le nouveau pixel est valide (remplace toujours, même un pixel valide existant), OU
-				# - Le pixel existant est no-data (on peut le remplacer même par no-data)
-				# Mais on ne remplace JAMAIS un pixel valide par un no-data
-				replace_mask = valid_new | (existing_nodata & ~valid_new)
-				
-				# Appliquer le remplacement
-				mosaic_region[replace_mask] = data_cropped[replace_mask]
-				mosaic[0, row_start:row_end, col_start:col_end] = mosaic_region
+		# Utiliser merge pour assembler (method='last' pour que les pixels suivants écrasent les précédents)
+		# L'ordre dans la liste détermine la priorité : les dernières images écrasent les premières
+		mosaic, out_trans = merge(srcs, method='last')
 		
 		# Métadonnées de sortie
-		out_meta = first_src.meta.copy()
+		out_meta = srcs[0].meta.copy()
 		out_meta.update({
 			'driver': 'GTiff',
-			'height': height,
-			'width': width,
+			'height': mosaic.shape[1],
+			'width': mosaic.shape[2],
 			'transform': out_trans,
-			'nodata': no_data_value,
 			'compress': 'lzw'
 		})
 		
@@ -498,7 +396,7 @@ def assemble_horizontal(image_paths, output_path, no_data):
 			src.close()
 
 #################################################################################################### 	
-def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, no_data):
+def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
 	"""
 	Assemble les dalles en utilisant rasterio au lieu de xing.
 	Note: chem_xing n'est plus utilisé mais conservé pour compatibilité de signature.
@@ -539,8 +437,7 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, n
 				weight_gauche,
 				weight_droite,
 				overlap_bounds,
-				chem_reconstruction,
-				no_data
+				chem_reconstruction
 			)
 			
 	####################################################################################################################################################		
@@ -563,7 +460,7 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, n
 		
 		# Assembler de gauche à droite
 		chem_final_tmp = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
-		assemble_horizontal(image_paths, chem_final_tmp, no_data)
+		assemble_horizontal(image_paths, chem_final_tmp)
 			
 	####################################################################################################################################################
 	## on assemble les rangées entre elles		 #####################################################################################################
@@ -599,8 +496,7 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, n
 			weight_haut,
 			weight_bas,
 			overlap_bounds,
-			chem_reconstruction,
-			no_data
+			chem_reconstruction
 		)
 			
 	####################################################################################################################################################
@@ -620,7 +516,7 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, n
 		image_paths.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s.tif' % (y, y+1)))
 	
 	# Assemblage final
-	assemble_horizontal(image_paths, chem_out, no_data)
+	assemble_horizontal(image_paths, chem_out)
 
 # #################################################################################################### 
 # def MakeDecoupage_OLD(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
@@ -698,7 +594,7 @@ def diff_2_mask_quality(args):
 	
 	data_in = read_as_2D_float(chem_in, no_data)
 	result = process_image(data_in, dl, no_data, percentile)
-	save_ABSOLUTE_image_with_same_geometry(result, chem_out, chem_in, no_data)
+	save_ABSOLUTE_image_with_same_geometry(result, chem_out, chem_in)
 	return
 
 #################################################################################################### 
@@ -828,10 +724,10 @@ if __name__ == '__main__':
 		#Traitement/Calcul en parallèle
 		DoParallel(RepTra, NbreDalleX, NbreDalleY, dl, no_data, percentile, iNbreCPU)
 		
-		#### Assemblage final - avec rasterio (remplace xingng)
+		#### Assemblage final - avec xingng = A REMPLACER !
 		# Le fichier d'assemblage est temporaire (fini par _tmp.tif)
 		chem_out_tmp = chem_out.replace('.tif', '_tmp.tif')
-		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra, no_data)
+		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra)
 		
 		#### Post-traitement 1: Remplacement des valeurs nodata par -9999
 		chem_out_clean = chem_out.replace('.tif', '_clean.tif')

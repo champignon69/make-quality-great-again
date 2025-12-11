@@ -122,11 +122,17 @@ def get_haut_histo(histo, seuil_haut):
 			return i
 
 #############################################################################################################################	
-def calculate_cdf_percent(pixel_array, percentile):
-	# Exclude the no-data value and calculate the 5% value of the CDF
-	pixel_array = pixel_array[pixel_array != -9999]
+def calculate_cdf_percent(pixel_array, percentile, no_data):
+	# Exclude the no-data value and NaN, then calculate the percentile value of the CDF
+	# Filtrer les valeurs invalides (no-data et NaN)
+	# ~np.isnan(pixel_array) permet d'exclure des pixels qui auraient la valeur NaN ('Not a Number')
+	# Même si on code le no_data en entrée et en sortie avec la valeur de l'utilisateur,
+	# certaines opérations numériques (division par zéro, etc.) peuvent générer des NaN à l'intérieur du traitement/intermédiaires.
+	# On continue donc à filtrer les NaN pour ne jamais les considérer comme valeurs valides dans les fenêtres de calcul de percentile.
+	valid_mask = (pixel_array != no_data) & ~np.isnan(pixel_array)
+	pixel_array = pixel_array[valid_mask]
 	if len(pixel_array) == 0:
-		return -9999  # Return no-data value if the window only contains no-data values
+		return no_data  # Return no-data value if the window only contains no-data values
 	sorted_pixels = np.sort(pixel_array)
 	index_5_percent = int(np.ceil(percentile * len(sorted_pixels))) - 1
 	return sorted_pixels[max(0, index_5_percent)]
@@ -144,15 +150,26 @@ def calculate_cdf_percent(pixel_array, percentile):
 	
 #############################################################################################################################	
 def process_image(image,dl,no_data,percentile):
+	# Convertir les NaN en no_data pour uniformiser
+	image = np.where(np.isnan(image), no_data, image)
+	
 	# Pad image to handle the borders
 	padded_image = np.pad(image, dl, mode='constant', constant_values=no_data)
-	# Use generic_filter from scipy.ndimage to apply the function over a 101x101 window
-	result = generic_filter(padded_image, lambda x: calculate_cdf_percent(x, percentile), size=(2*dl+1, 2*dl+1), mode='constant', cval=no_data)
+	
+	# Use generic_filter from scipy.ndimage to apply the function over a (2*dl+1)x(2*dl+1) window
+	# calculate_cdf_percent filtre automatiquement les no_data
+	result = generic_filter(padded_image, lambda x: calculate_cdf_percent(x, percentile, no_data), size=(2*dl+1, 2*dl+1), mode='constant', cval=no_data)
+	
 	# Crop the padded area off the result
-	return result[dl:-dl, dl:-dl]
+	result_cropped = result[dl:-dl, dl:-dl]
+	
+	# S'assurer que les valeurs invalides sont bien à no_data (déjà fait par calculate_cdf_percent, mais on double-vérifie)
+	result_cropped = np.where(np.isnan(result_cropped), no_data, result_cropped)
+	
+	return result_cropped
 	
 #############################################################################################################################	
-def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename):
+def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename, no_data):
     # Calculer la valeur absolue de l'image
     abs_image = np.abs(image)
     
@@ -160,11 +177,15 @@ def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename)
     with rasterio.open(src_filename) as src:
         metadata = src.meta.copy()  # Copiez les métadonnées de l'image source
         
+    # Convertir les NaN en no_data
+    abs_image = np.where(np.isnan(abs_image), no_data, abs_image)
+    
     # Mettez à jour les métadonnées avec les nouvelles dimensions si nécessaire
     metadata['height'], metadata['width'] = abs_image.shape
     metadata['dtype'] = abs_image.dtype  # Assurez-vous que le type de données correspond à l'image de sortie
+    metadata['nodata'] = no_data  # Définir explicitement le nodata à la valeur de l'utilisateur
     
-    # Utilisez lechem_xings métadonnées copiées pour écrire l'image dans un fichier .tif
+    # Utilisez les métadonnées copiées pour écrire l'image dans un fichier .tif
     with rasterio.open(output_filename, 'w', **metadata) as dst:
         dst.write(abs_image, 1)  # Écrit l'image dans la première bande en assumant qu'il s'agit d'une image à une seule bande
         
@@ -223,144 +244,383 @@ def CalculNombreDallesXY(NbColonnes,NbLignes,Taille_dalle,Recouv_entre_dalles):
 		
 	return (NbreDalleX,NbreDalleY) 
 	
-#################################################################################################### 	
-def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
-	
-	####################################################################################################################################################
-	####################################################################################################################################################		
-	## on assemble tout d'abord ligne par ligne	   #####################################################################################################
-	####################################################################################################################################################
-	####################################################################################################################################################
-	
-	####################################################################################################################################################		
-	## on raboute tout d'abord 2 dalles côte à côté (en X)	   #########################################################################################
-	####################################################################################################################################################	
-
+#################################################################################################### 
+def calculate_overlap_bounds(src1_path, src2_path):
+	"""Calcule les bounds de recouvrement entre deux dalles (intersection)."""
+	with rasterio.open(src1_path) as src1, rasterio.open(src2_path) as src2:
+		bounds1 = src1.bounds
+		bounds2 = src2.bounds
 		
+		# Intersection des bounds
+		left = max(bounds1.left, bounds2.left)
+		right = min(bounds1.right, bounds2.right)
+		bottom = max(bounds1.bottom, bounds2.bottom)
+		top = min(bounds1.top, bounds2.top)
+		
+		# Vérifier qu'il y a bien un recouvrement
+		if left >= right or bottom >= top:
+			return None
+			
+		return (left, bottom, right, top)  # X_0, Y_0, X_1, Y_1
+
+#################################################################################################### 
+def create_weight_image_horizontal(overlap_bounds, target_shape):
+	"""Crée une image de poids basée sur C/NC (colonne/nombre de colonnes).
+	Retourne un array numpy avec des valeurs entre 0 (gauche) et 1 (droite).
+	
+	Args:
+		overlap_bounds: (left, bottom, right, top) - bounds de recouvrement
+		target_shape: (height, width) - forme de l'array cible
+	"""
+	height, width = target_shape
+	
+	# Créer un array de poids basé sur la position en colonne
+	# C/NC : numéro de colonne / nombre de colonnes
+	col_indices = np.arange(width, dtype=np.float32)
+	weight_array = col_indices / (width - 1) if width > 1 else np.ones(width)
+	
+	# Étendre sur toutes les lignes
+	weights = np.tile(weight_array, (height, 1))
+	
+	return weights
+
+#################################################################################################### 
+def create_weight_image_vertical(overlap_bounds, target_shape):
+	"""Crée une image de poids basée sur L/NL (ligne/nombre de lignes).
+	Retourne un array numpy avec des valeurs entre 0 (haut) et 1 (bas).
+	
+	Args:
+		overlap_bounds: (left, bottom, right, top) - bounds de recouvrement
+		target_shape: (height, width) - forme de l'array cible
+	"""
+	height, width = target_shape
+	
+	# Créer un array de poids basé sur la position en ligne
+	# L/NL : numéro de ligne / nombre de lignes
+	row_indices = np.arange(height, dtype=np.float32)
+	weight_array = row_indices / (height - 1) if height > 1 else np.ones(height)
+	
+	# Étendre sur toutes les colonnes
+	weights = np.tile(weight_array.reshape(-1, 1), (1, width))
+	
+	return weights
+
+#################################################################################################### 
+def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_bounds, output_path, no_data):
+	"""Fait la moyenne pondérée de deux dalles dans la zone de recouvrement.
+	Formule: I1*I2 + I3*I4 où I1=dalle1, I2=poids1, I3=dalle2, I4=poids2
+	L'image de sortie a les bounds définis par overlap_bounds (équivalent à -cg:)."""
+	with rasterio.open(dalle1_path) as src1, rasterio.open(dalle2_path) as src2:
+		# Calculer les fenêtres de recouvrement pour chaque dalle
+		window1 = src1.window(*overlap_bounds)
+		window2 = src2.window(*overlap_bounds)
+		
+		# Lire les données dans la zone de recouvrement
+		data1 = src1.read(1, window=window1).astype(np.float32)
+		data2 = src2.read(1, window=window2).astype(np.float32)
+		
+		# Vérifier que les poids ont la bonne taille (devrait être le cas maintenant)
+		if weight1.shape != data1.shape or weight2.shape != data1.shape:
+			raise ValueError(f"Taille des poids incompatible: poids1={weight1.shape}, poids2={weight2.shape}, données={data1.shape}")
+		
+		# Gérer les no-data - normaliser à la valeur de l'utilisateur
+		no_data1 = src1.nodata if src1.nodata is not None else no_data
+		no_data2 = src2.nodata if src2.nodata is not None else no_data
+		no_data_out = no_data  # Utiliser la valeur de l'utilisateur comme nodata de sortie
+		
+		# Convertir les nodata des deux images en no_data_out pour uniformiser
+		data1 = np.where((data1 == no_data1) | np.isnan(data1), no_data_out, data1)
+		data2 = np.where((data2 == no_data2) | np.isnan(data2), no_data_out, data2)
+		
+		# Masques pour les valeurs valides (exclure no_data et NaN)
+		valid1 = (data1 != no_data_out) & ~np.isnan(data1)
+		valid2 = (data2 != no_data_out) & ~np.isnan(data2)
+		
+		# Calculer la moyenne pondérée
+		result = np.full_like(data1, no_data_out, dtype=np.float32)
+		
+		# Cas où les deux valeurs sont valides : moyenne pondérée
+		both_valid = valid1 & valid2
+		result[both_valid] = data1[both_valid] * weight1[both_valid] + data2[both_valid] * weight2[both_valid]
+		
+		# Cas où seule la dalle1 est valide
+		only1 = valid1 & ~valid2
+		result[only1] = data1[only1]
+		
+		# Cas où seule la dalle2 est valide
+		only2 = valid2 & ~valid1
+		result[only2] = data2[only2]
+		
+		# S'assurer qu'il n'y a pas de NaN dans le résultat
+		result = np.where(np.isnan(result), no_data_out, result)
+		
+		# Créer le transform pour l'image de sortie avec les bounds de recouvrement
+		# overlap_bounds = (left, bottom, right, top)
+		left, bottom, right, top = overlap_bounds
+		height, width = result.shape
+		
+		# Calculer la résolution
+		pixel_size_x = (right - left) / width
+		pixel_size_y = (top - bottom) / height
+		
+		# Créer le transform (coin haut-gauche)
+		from rasterio.transform import Affine
+		transform = Affine(pixel_size_x, 0.0, left,
+						   0.0, -pixel_size_y, top)
+		
+		# Métadonnées pour l'image de sortie
+		metadata = src1.meta.copy()
+		metadata.update({
+			'height': height,
+			'width': width,
+			'transform': transform,
+			'dtype': result.dtype,
+			'nodata': no_data_out,
+			'compress': 'lzw'
+		})
+		
+		# Écrire l'image de sortie
+		with rasterio.open(output_path, 'w', **metadata) as dst:
+			dst.write(result, 1)
+
+#################################################################################################### 
+def assemble_horizontal(image_paths, output_path, no_data):
+	"""Assemble des images de gauche à droite. 
+	Les pixels suivants écrasent les précédents en cas de recouvrement.
+	IMPORTANT: Les pixels no-data ne remplacent PAS les pixels valides existants."""
+	from rasterio.merge import merge
+	from rasterio.warp import reproject, Resampling
+	
+	# Trier les images par leur position X (left) pour garantir l'ordre de gauche à droite
+	image_bounds = []
+	for path in image_paths:
+		with rasterio.open(path) as src:
+			image_bounds.append((src.bounds.left, path))
+	
+	# Trier par position X (left)
+	image_bounds.sort(key=lambda x: x[0])
+	sorted_paths = [path for _, path in image_bounds]
+	
+	# Ouvrir toutes les images dans l'ordre trié
+	srcs = [rasterio.open(path) for path in sorted_paths]
+	
+	try:
+		# Calculer les bounds de toutes les images
+		all_bounds = [src.bounds for src in srcs]
+		minx = min(b.left for b in all_bounds)
+		miny = min(b.bottom for b in all_bounds)
+		maxx = max(b.right for b in all_bounds)
+		maxy = max(b.top for b in all_bounds)
+		
+		# Utiliser le transform et la résolution de la première image
+		first_src = srcs[0]
+		transform = first_src.transform
+		width = int((maxx - minx) / abs(transform.a))
+		height = int((maxy - miny) / abs(transform.e))
+		
+		# Créer le transform final
+		from rasterio.transform import from_bounds
+		out_trans = from_bounds(minx, miny, maxx, maxy, width, height)
+		
+		# Créer un array pour la mosaïque, initialisé avec no-data
+		no_data_value = no_data
+		mosaic = np.full((1, height, width), no_data_value, dtype=np.float32)
+		
+		# Assembler les images une par une, de gauche à droite
+		# Seuls les pixels VALIDES remplacent les précédents
+		for src in srcs:
+			# Lire les données de cette image
+			data = src.read(1).astype(np.float32)
+			
+			# Normaliser les no-data
+			src_nodata = src.nodata if src.nodata is not None else no_data_value
+			data = np.where((data == src_nodata) | np.isnan(data), no_data_value, data)
+			
+			# Calculer la fenêtre de cette image dans la mosaïque
+			window = rasterio.windows.from_bounds(
+				src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top,
+				out_trans
+			)
+			
+			# Calculer les indices (arrondir pour éviter les problèmes d'alignement)
+			row_start = max(0, int(round(window.row_off)))
+			row_end = min(height, row_start + data.shape[0])
+			col_start = max(0, int(round(window.col_off)))
+			col_end = min(width, col_start + data.shape[1])
+			
+			# Ajuster data si nécessaire
+			data_rows = row_end - row_start
+			data_cols = col_end - col_start
+			
+			if data_rows > 0 and data_cols > 0 and data_rows <= data.shape[0] and data_cols <= data.shape[1]:
+				# Extraire la partie de data qui correspond
+				data_cropped = data[:data_rows, :data_cols]
+				
+				# Extraire la région correspondante dans la mosaïque
+				mosaic_region = mosaic[0, row_start:row_end, col_start:col_end]
+				
+				# Masque pour les pixels valides de la nouvelle image
+				valid_new = (data_cropped != no_data_value) & ~np.isnan(data_cropped)
+				
+				# Masque pour les pixels no-data existants dans la mosaïque
+				existing_nodata = (mosaic_region == no_data_value) | np.isnan(mosaic_region)
+				
+				# Masque pour les pixels valides existants dans la mosaïque
+				existing_valid = ~existing_nodata
+				
+				# Remplacer seulement si :
+				# - Le nouveau pixel est valide (remplace toujours, même un pixel valide existant), OU
+				# - Le pixel existant est no-data (on peut le remplacer même par no-data)
+				# Mais on ne remplace JAMAIS un pixel valide par un no-data
+				replace_mask = valid_new | (existing_nodata & ~valid_new)
+				
+				# Appliquer le remplacement
+				mosaic_region[replace_mask] = data_cropped[replace_mask]
+				mosaic[0, row_start:row_end, col_start:col_end] = mosaic_region
+		
+		# Métadonnées de sortie
+		out_meta = first_src.meta.copy()
+		out_meta.update({
+			'driver': 'GTiff',
+			'height': height,
+			'width': width,
+			'transform': out_trans,
+			'nodata': no_data_value,
+			'compress': 'lzw'
+		})
+		
+		# Écrire l'image assemblée
+		with rasterio.open(output_path, 'w', **out_meta) as dst:
+			dst.write(mosaic)
+	finally:
+		# Fermer toutes les sources
+		for src in srcs:
+			src.close()
+
+#################################################################################################### 	
+def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra, no_data):
+	"""
+	Assemble les dalles en utilisant rasterio au lieu de xing.
+	Note: chem_xing n'est plus utilisé mais conservé pour compatibilité de signature.
+	"""
+	####################################################################################################################################################
+	## on raboute tout d'abord 2 dalles côte à côte (en X)	   #########################################################################################
+	####################################################################################################################################################
+	
 	# Boucle avec barre de progression pour le raboutage des dalles côte à côte
 	for y in tqdm(range(NbreDalleY), desc="Raboutage en colonnes"):
 		for x in tqdm(range(NbreDalleX-1), desc="Progression en Colonne", leave=False):
 			
 			## Nom de la dalle courante	
-			chem_MASK_QUALITY_dalle_xy=os.path.join(RepTra,"Dalle_%s_%s"%(x,y),"MASK_%s_%s.tif"%(x,y))
-			#print(chem_MASK_QUALITY_dalle_xy)
-			chem_MASK_QUALITY_dalle_xy_droite=os.path.join(RepTra,"Dalle_%s_%s"%(x+1,y),"MASK_%s_%s.tif"%(x+1,y))
-			#print(chem_MASK_QUALITY_dalle_xy_droite)
-				
-			## IMAGE GAUCHE / IMAGE DROITE <> DALLE_0_0 / DALLE_1_0 !
-			chem_tmp=os.path.join(RepTra,'diff_tmp.tif')
-			cmd_1="%s -i %s %s -X- -o %s -n:" %(chem_xing,chem_MASK_QUALITY_dalle_xy,chem_MASK_QUALITY_dalle_xy_droite,chem_tmp)
-			#print(cmd_1)
-			os.system(cmd_1)
-				
-			cmd_2="%s -i %s -e'C/NC' -o  %s -tf -n:" %(chem_xing,chem_tmp,os.path.join(RepTra,'poids_HG_HD_pour_HD.tif'))
-			#print(cmd_2)
-			os.system(cmd_2)
+			chem_MASK_QUALITY_dalle_xy = os.path.join(RepTra, "Dalle_%s_%s" % (x, y), "MASK_%s_%s.tif" % (x, y))
+			chem_MASK_QUALITY_dalle_xy_droite = os.path.join(RepTra, "Dalle_%s_%s" % (x+1, y), "MASK_%s_%s.tif" % (x+1, y))
 			
-			cmd_3="%s -i %s -e'1-I1' -o  %s -n:" %(chem_xing,os.path.join(RepTra,'poids_HG_HD_pour_HD.tif'),os.path.join(RepTra,'poids_HG_HD_pour_HG.tif'))
-			#print(cmd_3)
-			os.system(cmd_3)
-				
-			liste_info_tmp=GetInfo(chem_xing, os.path.join(RepTra,'poids_HG_HD_pour_HD.tif'))
-				
-			cmd_final="%s -i %s %s %s %s -e'I1*I2+I3*I4' -o %s -cg:%s:%s:%s:%s -n:" %(chem_xing,chem_MASK_QUALITY_dalle_xy,
-																					os.path.join(RepTra,'poids_HG_HD_pour_HG.tif'),
-																					chem_MASK_QUALITY_dalle_xy_droite, 
-																					os.path.join(RepTra,'poids_HG_HD_pour_HD.tif'),
-																					os.path.join(RepTra,'reconstruction_dalle_%s_%s_%s.tif' %(x,x+1,y)),
-																					liste_info_tmp[3],
-																					liste_info_tmp[4],
-																					liste_info_tmp[5],
-																					liste_info_tmp[6])
-																																									
-			#print(cmd_final)
-			os.system(cmd_final)
+			# Calculer les bounds de recouvrement
+			overlap_bounds = calculate_overlap_bounds(chem_MASK_QUALITY_dalle_xy, chem_MASK_QUALITY_dalle_xy_droite)
+			
+			if overlap_bounds is None:
+				print(f"Attention: Pas de recouvrement entre dalle ({x},{y}) et ({x+1},{y})")
+				continue
+			
+			# Lire la shape des données pour créer les poids de la bonne taille
+			with rasterio.open(chem_MASK_QUALITY_dalle_xy_droite) as src:
+				window = src.window(*overlap_bounds)
+				target_shape = (int(window.height), int(window.width))
+			
+			# Créer les images de poids (horizontal: C/NC)
+			weight_droite = create_weight_image_horizontal(overlap_bounds, target_shape)
+			weight_gauche = 1.0 - weight_droite
+			
+			# Faire la moyenne pondérée dans la zone de recouvrement
+			chem_reconstruction = os.path.join(RepTra, 'reconstruction_dalle_%s_%s_%s.tif' % (x, x+1, y))
+			weighted_blend_overlap(
+				chem_MASK_QUALITY_dalle_xy,
+				chem_MASK_QUALITY_dalle_xy_droite,
+				weight_gauche,
+				weight_droite,
+				overlap_bounds,
+				chem_reconstruction,
+				no_data
+			)
 			
 	####################################################################################################################################################		
 	## on raboute toutes les dalles sur une même rangée		#########################################################################################
 	####################################################################################################################################################
 				
 	## on réassemble tout	
-	## for y in range(NbreDalleY):
 	for y in tqdm(range(NbreDalleY), desc="Raboutage en ligne"):
 		
-		### initialisation ligne de commande
-		cmd_assemblage_final_par_ligne="%s -i " %chem_xing
+		# Construire la liste des images à assembler: dalles originales + images de transition
+		image_paths = []
 		
-		for x in range(NbreDalleX):		
-			cmd_assemblage_final_par_ligne=cmd_assemblage_final_par_ligne+" "+os.path.join(RepTra,"Dalle_%s_%s"%(x,y),"MASK_%s_%s.tif"%(x,y))
-								
+		# Ajouter les dalles originales
+		for x in range(NbreDalleX):
+			image_paths.append(os.path.join(RepTra, "Dalle_%s_%s" % (x, y), "MASK_%s_%s.tif" % (x, y)))
+		
+		# Ajouter les images de transition
 		for x in range(NbreDalleX-1):
-			cmd_assemblage_final_par_ligne=cmd_assemblage_final_par_ligne+" "+os.path.join(RepTra,'reconstruction_dalle_%s_%s_%s.tif' %(x,x+1,y))
-				
-		#
-		chem_final_tmp=os.path.join(RepTra,'reconstruction_dalle_%s.tif' %y) 
-		str_tmp=" -a -o %s -n:" %chem_final_tmp
-		cmd_assemblage_final_par_ligne+=str_tmp
-			
-		#print(cmd_assemblage_final_par_ligne)
-		os.system(cmd_assemblage_final_par_ligne)	
+			image_paths.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s_%s.tif' % (x, x+1, y)))
+		
+		# Assembler de gauche à droite
+		chem_final_tmp = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
+		assemble_horizontal(image_paths, chem_final_tmp, no_data)
 			
 	####################################################################################################################################################
-	####################################################################################################################################################				
 	## on assemble les rangées entre elles		 #####################################################################################################
 	####################################################################################################################################################
-	####################################################################################################################################################
 				
 	## on réassemble tout	
-	## for y in range(NbreDalleY-1):
 	for y in tqdm(range(NbreDalleY-1), desc="Assemblage final"):
 			
-		chem_dalle_y=os.path.join(RepTra,'reconstruction_dalle_%s.tif' %y)			 
-		chem_dalle_y_dessous=os.path.join(RepTra,'reconstruction_dalle_%s.tif' %(y+1))
+		chem_dalle_y = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
+		chem_dalle_y_dessous = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % (y+1))
+		
+		# Calculer les bounds de recouvrement
+		overlap_bounds = calculate_overlap_bounds(chem_dalle_y, chem_dalle_y_dessous)
+		
+		if overlap_bounds is None:
+			print(f"Attention: Pas de recouvrement entre ligne {y} et {y+1}")
+			continue
+		
+		# Lire la shape des données pour créer les poids de la bonne taille
+		with rasterio.open(chem_dalle_y_dessous) as src:
+			window = src.window(*overlap_bounds)
+			target_shape = (int(window.height), int(window.width))
+		
+		# Créer les images de poids (vertical: L/NL)
+		weight_bas = create_weight_image_vertical(overlap_bounds, target_shape)
+		weight_haut = 1.0 - weight_bas
+		
+		# Faire la moyenne pondérée dans la zone de recouvrement
+		chem_reconstruction = os.path.join(RepTra, 'reconstruction_dalle_%s_%s.tif' % (y, y+1))
+		weighted_blend_overlap(
+			chem_dalle_y,
+			chem_dalle_y_dessous,
+			weight_haut,
+			weight_bas,
+			overlap_bounds,
+			chem_reconstruction,
+			no_data
+		)
 			
-		cmd_1="%s -i %s %s -X- -o %s -n:" %(chem_xing,chem_dalle_y,chem_dalle_y_dessous,os.path.join(RepTra,'diff_tmp.tif'))
-		#print(cmd_1)
-		os.system(cmd_1)
-			
-		cmd_2="%s -i %s -e'L/NL' -o %s -tf -n:" %(chem_xing,os.path.join(RepTra,'diff_tmp.tif'),os.path.join(RepTra,'poids_HG_BG_pour_BG.tif'))
-		#print(cmd_2)
-		os.system(cmd_2)
-			
-		cmd_3="%s -i %s -e'1-I1' -o %s -n:" %(chem_xing,os.path.join(RepTra,'poids_HG_BG_pour_BG.tif'),os.path.join(RepTra,'poids_HG_BG_pour_HG.tif'))
-		#print(cmd_3)
-		os.system(cmd_3)			
-			
-		liste_info_tmp=GetInfo(chem_xing, os.path.join(RepTra,'poids_HG_BG_pour_BG.tif'))
-			
-		cmd_final="%s -i %s %s %s %s -e'I1*I2+I3*I4' -o %s -cg:%s:%s:%s:%s -n:" %(chem_xing,chem_dalle_y,
-																				os.path.join(RepTra,'poids_HG_BG_pour_HG.tif'),
-																				chem_dalle_y_dessous,os.path.join(RepTra,'poids_HG_BG_pour_BG.tif'),
-																				os.path.join(RepTra,
-																				'reconstruction_dalle_%s_%s.tif' %(y,y+1)),
-																				liste_info_tmp[3],
-																				liste_info_tmp[4],
-																				liste_info_tmp[5],
-																				liste_info_tmp[6])
-		#print(cmd_final)
-		os.system(cmd_final)
-			
-	### initialisation ligne de commande
-	cmd_assemblage_final="%s -i " %chem_xing
-			
-	## on réassemble tout	
+	####################################################################################################################################################
+	## Assemblage final de toutes les lignes		 #####################################################################################################
+	####################################################################################################################################################
+	
+	# Construire la liste des images à assembler: lignes assemblées + images de transition verticales
+	image_paths = []
+	
+	# Ajouter les lignes assemblées
 	for y in range(NbreDalleY):
-		chem_dalle_y=os.path.join(RepTra,'reconstruction_dalle_%s.tif' %y)	 
-		cmd_assemblage_final=cmd_assemblage_final+" "+chem_dalle_y
-			
-	## on réassemble tout	
+		chem_dalle_y = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
+		image_paths.append(chem_dalle_y)
+		
+	# Ajouter les images de transition verticales
 	for y in range(NbreDalleY-1):
-		cmd_assemblage_final=cmd_assemblage_final+" "+os.path.join(RepTra,'reconstruction_dalle_%s_%s.tif' %(y,y+1))
-		
-	str_tmp=" -a -o %s -n:" %chem_out
-	cmd_assemblage_final+=str_tmp
-			
-	#print(cmd_assemblage_final)
-	os.system(cmd_assemblage_final)   
-		
-	# MASK_
-	# MASK_
-	# MASK_
+		image_paths.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s.tif' % (y, y+1)))
+	
+	# Assemblage final
+	assemble_horizontal(image_paths, chem_out, no_data)
 
 # #################################################################################################### 
 # def MakeDecoupage_OLD(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
@@ -438,7 +698,7 @@ def diff_2_mask_quality(args):
 	
 	data_in = read_as_2D_float(chem_in, no_data)
 	result = process_image(data_in, dl, no_data, percentile)
-	save_ABSOLUTE_image_with_same_geometry(result, chem_out, chem_in)
+	save_ABSOLUTE_image_with_same_geometry(result, chem_out, chem_in, no_data)
 	return
 
 #################################################################################################### 
@@ -568,10 +828,10 @@ if __name__ == '__main__':
 		#Traitement/Calcul en parallèle
 		DoParallel(RepTra, NbreDalleX, NbreDalleY, dl, no_data, percentile, iNbreCPU)
 		
-		#### Assemblage final - avec xingng = A REMPLACER !
+		#### Assemblage final - avec rasterio (remplace xingng)
 		# Le fichier d'assemblage est temporaire (fini par _tmp.tif)
 		chem_out_tmp = chem_out.replace('.tif', '_tmp.tif')
-		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra)
+		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra, no_data)
 		
 		#### Post-traitement 1: Remplacement des valeurs nodata par -9999
 		chem_out_clean = chem_out.replace('.tif', '_clean.tif')

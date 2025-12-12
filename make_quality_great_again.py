@@ -16,6 +16,8 @@ from osgeo import ogr, gdal
 #
 import numpy as np
 import rasterio
+from rasterio.merge import merge
+from rasterio.windows import from_bounds
 import imageio
 import scipy as sp
 import scipy.misc as sm
@@ -33,12 +35,15 @@ import signal
 
 # Chemin vers xingng - peut être défini via variable d'environnement XINGNG_PATH
 # ou utilise le chemin par défaut
-_DEFAULT_XINGNG_PATH = '/Volumes/ALI_Serveur/DEPLOIEMENT/bin_linux/xingng'
+# _DEFAULT_XINGNG_PATH = '/Volumes/ALI_Serveur/DEPLOIEMENT/bin_linux/xingng'
+
+_DEFAULT_XINGNG_PATH = os.path.expanduser('~/xingng')
 
 def get_xingng_path():
     """Récupère le chemin vers xingng et vérifie qu'il est accessible."""
     chem_xing = os.environ.get('XINGNG_PATH', _DEFAULT_XINGNG_PATH)
-    
+    chem_xing = os.path.expanduser(chem_xing)  # Assure l'expansion du ~ même via variable d'env
+
     # Vérification que xingng existe et est exécutable
     if not os.path.isfile(chem_xing):
         raise FileNotFoundError(
@@ -354,9 +359,131 @@ def weighted_blend_overlap(dalle1_path, dalle2_path, weight1, weight2, overlap_b
 		with rasterio.open(output_path, 'w', **metadata) as dst:
 			dst.write(result, 1)
 
+
+def assemble_tiles_and_overlaps(masks, overlaps, output_path):
+
+    # --- 1) MOSAÏQUE DES TUILES PRINCIPALES ---
+    src_masks = [rasterio.open(p) for p in masks]
+    nodata = src_masks[0].nodata if src_masks[0].nodata is not None else -9999
+
+    mosaic, mosaic_transform = merge(
+        src_masks,
+        nodata=nodata,
+        method="last"
+    )
+
+    meta = src_masks[0].meta.copy()
+    meta.update({
+        "height": mosaic.shape[1],
+        "width": mosaic.shape[2],
+        "transform": mosaic_transform,
+        "nodata": nodata,
+        "compress": "lzw"
+    })
+
+    # Convertir la mosaïque en édition locale
+    final = mosaic.astype(np.float32)
+
+    # --- 2) APPLICATION DES PATCHS DE RECOUVREMENT ---
+    for patch_path in overlaps:
+        with rasterio.open(patch_path) as patch:
+
+            # Fenêtre d'insertion (patch → mosaïque)
+            win = from_bounds(
+                patch.bounds.left,
+                patch.bounds.bottom,
+                patch.bounds.right,
+                patch.bounds.top,
+                transform=mosaic_transform
+            )
+            # Rasterio peut retourner des offsets/taille flottants : on les arrondit pour indexer numpy
+            win = win.round_offsets().round_lengths()
+            row_off, col_off = int(win.row_off), int(win.col_off)
+            height, width = int(win.height), int(win.width)
+
+            # Lecture du patch à la taille exacte de la fenêtre
+            patch_arr = patch.read(1, out_shape=(height, width))
+
+            # Extraction du bloc correspondant dans la mosaïque
+            final_block = final[0, row_off:row_off+height,
+                                   col_off:col_off+width]
+
+            # Pixels valides = non nodata
+            valid = patch_arr != nodata
+
+            # Remplacement
+            final_block[valid] = patch_arr[valid]
+
+            # Réécriture dans la mosaïque
+            final[0, row_off:row_off+height,
+                     col_off:col_off+width] = final_block
+
+    # --- 3) ENREGISTREMENT ---
+    with rasterio.open(output_path, "w", **meta) as dst:
+        dst.write(final)
+
+    # Fermeture des tuiles principales
+    for s in src_masks:
+        s.close()
+
+
+def assemble_lines_and_overlaps(lines, overlaps, output_path):
+    """
+    Variante verticale : assemble les lignes mosaïquées, puis applique les patches verticaux.
+    Comportement nodata : les pixels nodata des patches n'écrasent pas les pixels valides existants.
+    """
+    src_lines = [rasterio.open(p) for p in lines]
+    nodata = src_lines[0].nodata if src_lines[0].nodata is not None else -9999
+
+    mosaic, mosaic_transform = merge(
+        src_lines,
+        nodata=nodata,
+        method="last"
+    )
+
+    meta = src_lines[0].meta.copy()
+    meta.update({
+        "height": mosaic.shape[1],
+        "width": mosaic.shape[2],
+        "transform": mosaic_transform,
+        "nodata": nodata,
+        "compress": "lzw"
+    })
+
+    final = mosaic.astype(np.float32)
+
+    for patch_path in overlaps:
+        with rasterio.open(patch_path) as patch:
+            win = from_bounds(
+                patch.bounds.left,
+                patch.bounds.bottom,
+                patch.bounds.right,
+                patch.bounds.top,
+                transform=mosaic_transform
+            )
+            win = win.round_offsets().round_lengths()
+            row_off, col_off = int(win.row_off), int(win.col_off)
+            height, width = int(win.height), int(win.width)
+
+            patch_arr = patch.read(1, out_shape=(height, width))
+            final_block = final[0, row_off:row_off+height,
+                                   col_off:col_off+width]
+            valid = patch_arr != nodata
+            final_block[valid] = patch_arr[valid]
+            final[0, row_off:row_off+height,
+                     col_off:col_off+width] = final_block
+
+    with rasterio.open(output_path, "w", **meta) as dst:
+        dst.write(final)
+
+    for s in src_lines:
+        s.close()
+
+
 #################################################################################################### 
-def assemble_horizontal(image_paths, output_path):
-	"""Assemble des images de gauche à droite. Les pixels suivants écrasent les précédents en cas de recouvrement."""
+def assemble_horizontal_OLD(image_paths, output_path):
+	"""Assemble des images de gauche à droite. Les pixels suivants écrasent les précédents en cas de recouvrement.
+	Les pixels NoData ne remplacent jamais les pixels valides grâce à skip_empty=True."""
 	from rasterio.merge import merge
 	
 	# Trier les images par leur position X (left) pour garantir l'ordre de gauche à droite
@@ -369,13 +496,23 @@ def assemble_horizontal(image_paths, output_path):
 	image_bounds.sort(key=lambda x: x[0])
 	sorted_paths = [path for _, path in image_bounds]
 	
+	# Récupérer la valeur nodata de la première image (on suppose qu'elles sont identiques)
+	with rasterio.open(sorted_paths[0]) as first:
+		nodata_val = first.nodata if first.nodata is not None else -9999
+	
 	# Ouvrir toutes les images dans l'ordre trié
 	srcs = [rasterio.open(path) for path in sorted_paths]
 	
 	try:
 		# Utiliser merge pour assembler (method='last' pour que les pixels suivants écrasent les précédents)
+		# skip_empty=True empêche les pixels NoData d'écraser les pixels valides
 		# L'ordre dans la liste détermine la priorité : les dernières images écrasent les premières
-		mosaic, out_trans = merge(srcs, method='last')
+		mosaic, out_trans = merge(
+			srcs,
+			method='last',
+			nodata=nodata_val,
+			skip_empty=True  # Ne pas remplacer les pixels valides par du NoData
+		)
 		
 		# Métadonnées de sortie
 		out_meta = srcs[0].meta.copy()
@@ -384,7 +521,8 @@ def assemble_horizontal(image_paths, output_path):
 			'height': mosaic.shape[1],
 			'width': mosaic.shape[2],
 			'transform': out_trans,
-			'compress': 'lzw'
+			'compress': 'lzw',
+			'nodata': nodata_val
 		})
 		
 		# Écrire l'image assemblée
@@ -443,32 +581,51 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
 	####################################################################################################################################################		
 	## on raboute toutes les dalles sur une même rangée		#########################################################################################
 	####################################################################################################################################################
-				
+	print("Raboutage en ligne NbreDalleY = ", NbreDalleY)			
+
 	## on réassemble tout	
 	for y in tqdm(range(NbreDalleY), desc="Raboutage en ligne"):
 		
 		# Construire la liste des images à assembler: dalles originales + images de transition
 		image_paths = []
-		
+		overlaps = []
 		# Ajouter les dalles originales
 		for x in range(NbreDalleX):
 			image_paths.append(os.path.join(RepTra, "Dalle_%s_%s" % (x, y), "MASK_%s_%s.tif" % (x, y)))
 		
 		# Ajouter les images de transition
 		for x in range(NbreDalleX-1):
-			image_paths.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s_%s.tif' % (x, x+1, y)))
+			overlaps.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s_%s.tif' % (x, x+1, y)))
 		
 		# Assembler de gauche à droite
 		chem_final_tmp = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
-		assemble_horizontal(image_paths, chem_final_tmp)
-			
+
+		print("image_paths = ", image_paths)
+		print("chem_final_tmp = ", chem_final_tmp)
+		print("overlaps = ", overlaps)
+
+		try:
+			assemble_tiles_and_overlaps(image_paths, overlaps, chem_final_tmp)
+		except Exception as e:
+			print("ERREUR dans assemble_horizontal:", type(e), e)
+			import traceback
+			traceback.print_exc()
+			print("Vérifiez que la fonction assemble_horizontal est bien importée/définie, qu'il n'y a pas d'erreur de nom de variable ou d'accès aux fichiers ci-dessus.")
+			print("Voici la liste des images à assembler, pour vérification des accès fichiers :")
+			for ip in image_paths:
+				print("  - ", ip, "-->", os.path.exists(ip))
+			print("chem_final_tmp =", chem_final_tmp, "--> dossier existe ?", os.path.exists(os.path.dirname(chem_final_tmp)))
+			raise  # relancer l'exception pour arrêt si debug
+
+		print("FIN")
 	####################################################################################################################################################
 	## on assemble les rangées entre elles		 #####################################################################################################
 	####################################################################################################################################################
-				
+	print('===============================================================')
 	## on réassemble tout	
 	for y in tqdm(range(NbreDalleY-1), desc="Assemblage final"):
 			
+		print("Hello")	
 		chem_dalle_y = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % y)
 		chem_dalle_y_dessous = os.path.join(RepTra, 'reconstruction_dalle_%s.tif' % (y+1))
 		
@@ -503,8 +660,9 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
 	## Assemblage final de toutes les lignes		 #####################################################################################################
 	####################################################################################################################################################
 	
-	# Construire la liste des images à assembler: lignes assemblées + images de transition verticales
+	# Assemblage final vertical : lignes mosaïquées + patches verticaux
 	image_paths = []
+	overlaps = []
 	
 	# Ajouter les lignes assemblées
 	for y in range(NbreDalleY):
@@ -513,43 +671,11 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
 		
 	# Ajouter les images de transition verticales
 	for y in range(NbreDalleY-1):
-		image_paths.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s.tif' % (y, y+1)))
+		overlaps.append(os.path.join(RepTra, 'reconstruction_dalle_%s_%s.tif' % (y, y+1)))
 	
-	# Assemblage final
-	assemble_horizontal(image_paths, chem_out)
+	# Assemblage final (vertical)
+	assemble_lines_and_overlaps(image_paths, overlaps, chem_out)
 
-# #################################################################################################### 
-# def MakeDecoupage_OLD(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
-	
-	# p=Pool(iNbreCPU)
-	
-	# for x in range(NbreDalleX):
-		# for y in range(NbreDalleY):
-			# #créer le nom du répertoire
-			# RepDalleXY=os.path.join(RepTra,"Dalle_%s_%s"%(x,y))
-			# #print(RepDalleXY)
-			# #créer le répertoire, s'il n'existe pas déjà
-			# if not os.path.isdir(RepDalleXY): os.mkdir(RepDalleXY)
-								
-			# #Détermination de col_min, col_max, lig_min, lig_max pour la dalle XY
-			# colminDalleXY=x*(iTailleparcelle-iTailleRecouvrement)
-			# colmaxDalleXY=x*(iTailleparcelle-iTailleRecouvrement)+iTailleparcelle
-			# ligminDalleXY=y*(iTailleparcelle-iTailleRecouvrement)
-			# ligmaxDalleXY=y*(iTailleparcelle-iTailleRecouvrement)+iTailleparcelle
-				
-			# #fichier out mns
-			# Chem_decoup=os.path.join(RepDalleXY,"IN_%s_%s.tif"%(x,y))
-			# #print(Chem_decoup)
-				
-			# ### crop MNS
-			# cmdCROP = "%s -i %s -ci:%s:%s:%s:%s -o %s -n:" % (chem_xing, chem_in, ligminDalleXY, ligmaxDalleXY, colminDalleXY, colmaxDalleXY, Chem_decoup)
-			# #print(cmdCROP)
-			# #os.system(cmdCROP)
-			# p.apply_async(os.system,[cmdCROP])
-		
-	# p.close(); p.join(); p.terminate()
-	
-	# return
 	
 #################################################################################################### 
 def MakeDecoupage(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
@@ -729,6 +855,7 @@ if __name__ == '__main__':
 		chem_out_tmp = chem_out.replace('.tif', '_tmp.tif')
 		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra)
 		
+		print('0')
 		#### Post-traitement 1: Remplacement des valeurs nodata par -9999
 		chem_out_clean = chem_out.replace('.tif', '_clean.tif')
 		cmd_clean = "%s -i %s -e'I1.1!=I1.1?-9999:I1.1' -o %s" % (chem_xing, chem_out_tmp, chem_out_clean)

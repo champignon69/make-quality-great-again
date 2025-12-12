@@ -861,8 +861,74 @@ def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
 
 	
 #################################################################################################### 
-def MakeDecoupage(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
+def crop_tile(args):
+	"""
+	Fonction pour découper une dalle d'une image (utilisée en parallèle).
 	
+	Args:
+		args: tuple (chem_in, Chem_decoup, ligmin, ligmax, colmin, colmax)
+	"""
+	chem_in, Chem_decoup, ligmin, ligmax, colmin, colmax = args
+	
+	# Ouvrir l'image source
+	with rasterio.open(chem_in, 'r') as src:
+		# Calculer les dimensions de la fenêtre
+		# ligmin inclus, ligmax exclusif -> height = ligmax - ligmin
+		# colmin inclus, colmax exclusif -> width = colmax - colmin
+		height = ligmax - ligmin
+		width = colmax - colmin
+		
+		# Tronquer si la fenêtre dépasse les limites de l'image
+		max_row = src.height
+		max_col = src.width
+		
+		# Si la fenêtre est complètement en dehors de l'image, on ne fait rien
+		if ligmin >= max_row or colmin >= max_col or ligmax <= 0 or colmax <= 0:
+			print(f"Attention: Fenêtre complètement hors limites pour {Chem_decoup}")
+			return
+		
+		# Ajuster les offsets pour qu'ils soient >= 0
+		row_off = max(0, ligmin)
+		col_off = max(0, colmin)
+		
+		# Ajuster la taille si la fenêtre dépasse les limites
+		if row_off + height > max_row:
+			height = max_row - row_off
+		if col_off + width > max_col:
+			width = max_col - col_off
+		
+		# Vérifier que la fenêtre est valide après ajustement
+		if height <= 0 or width <= 0:
+			print(f"Attention: Fenêtre invalide pour {Chem_decoup} (height={height}, width={width})")
+			return
+		
+		# Créer la fenêtre de découpage
+		window = rasterio.windows.Window(col_off=col_off, row_off=row_off, width=width, height=height)
+		
+		# Lire les données dans la fenêtre
+		data = src.read(1, window=window)
+		
+		# Calculer le nouveau transform pour cette fenêtre
+		transform = rasterio.windows.transform(window, src.transform)
+		
+		# Copier les métadonnées et les mettre à jour
+		metadata = src.meta.copy()
+		metadata.update({
+			'height': height,
+			'width': width,
+			'transform': transform,
+			'compress': 'lzw'
+		})
+		
+		# Écrire la dalle découpée
+		with rasterio.open(Chem_decoup, 'w', **metadata) as dst:
+			dst.write(data, 1)
+
+#################################################################################################### 
+def MakeDecoupage(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTailleRecouvrement, iNbreCPU):
+	"""
+	Découpe l'image en dalles en utilisant rasterio (version open source).
+	"""
 	tasks = []
 	
 	for x in range(NbreDalleX):
@@ -880,15 +946,14 @@ def MakeDecoupage(chem_in, RepTra, NbreDalleX, NbreDalleY, iTailleparcelle, iTai
 				
 			#fichier out mns
 			Chem_decoup=os.path.join(RepDalleXY,"IN_%s_%s.tif"%(x,y))
-			#print(Chem_decoup)
-				
-			### crop MNS
-			cmdCROP = "%s -i %s -ci:%s:%s:%s:%s -o %s -n:" % (chem_xing, chem_in, ligminDalleXY, ligmaxDalleXY, colminDalleXY, colmaxDalleXY, Chem_decoup)
-			tasks.append(cmdCROP)
+			
+			# Préparer les arguments pour la fonction de découpage
+			args = (chem_in, Chem_decoup, ligminDalleXY, ligmaxDalleXY, colminDalleXY, colmaxDalleXY)
+			tasks.append(args)
 			
 	# Initialize the pool
 	with Pool(processes=iNbreCPU, initializer=init_worker) as pool:
-		results = list(tqdm(pool.imap_unordered(os.system, tasks), total=len(tasks), desc="Découpage en parallèle des dalles"))
+		results = list(tqdm(pool.imap_unordered(crop_tile, tasks), total=len(tasks), desc="Découpage en parallèle des dalles"))
 		
 	return
 			

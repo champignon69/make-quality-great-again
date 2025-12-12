@@ -980,6 +980,35 @@ def diff_2_mask_quality(args):
 # 	return
 	
 #################################################################################################### 
+def create_negative_image(chem_in, chem_out, no_data=-9999):
+	"""
+	Crée une version "négative" de l'image : remplace les pixels > 0 par no_data.
+	Équivalent à xing -e'I1.1>0?%s:I1.1'
+	
+	Args:
+		chem_in: Chemin vers l'image d'entrée
+		chem_out: Chemin vers l'image de sortie
+		no_data: Valeur nodata (par défaut -9999)
+	"""
+	# Lire l'image
+	with rasterio.open(chem_in, 'r') as src:
+		data = src.read(1).astype(np.float32)
+		metadata = src.meta.copy()
+	
+	# Créer une copie des données
+	result = data.copy()
+	
+	# Remplacer les pixels > 0 par no_data
+	# Les pixels <= 0 sont conservés, ainsi que les pixels nodata existants
+	mask_positive = (data > 0) & (data != no_data) & ~np.isnan(data)
+	result[mask_positive] = no_data
+	
+	# Sauvegarder l'image résultante
+	metadata['dtype'] = result.dtype
+	with rasterio.open(chem_out, 'w', **metadata) as dst:
+		dst.write(result, 1)
+
+#################################################################################################### 
 def init_worker():
 	signal.signal(signal.SIGINT, signal.SIG_IGN)
 	
@@ -998,9 +1027,8 @@ def DoParallel(RepTra, NbreDalleX, NbreDalleY, dl, no_data, percentile, iNbreCPU
 			chem_in_dalle_NEG=os.path.join(RepDalleXY,"IN_%s_%s_NEG.tif"%(x,y))
 			chem_out_dalle=os.path.join(RepDalleXY,"MASK_%s_%s.tif"%(x,y))
 			#
-			cmd_xing="%s -i %s -e'I1.1>0?%s:I1.1' -o %s -n:" %(chem_xing,chem_in_dalle,no_data,chem_in_dalle_NEG)
-			print('cmd_xing > ',cmd_xing)
-			os.system(cmd_xing)
+			# Créer la version négative (remplace xing -e'I1.1>0?%s:I1.1')
+			create_negative_image(chem_in_dalle, chem_in_dalle_NEG, no_data)
 			#
 			args=(chem_in_dalle_NEG, chem_out_dalle, dl, no_data, percentile)
 			tasks.append(args)

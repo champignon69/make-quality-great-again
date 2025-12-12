@@ -22,7 +22,8 @@ import imageio
 import scipy as sp
 import scipy.misc as sm
 import scipy.sparse.linalg as ssl
-from scipy.ndimage import generic_filter
+from scipy.ndimage import generic_filter, uniform_filter
+from scipy.interpolate import LinearNDInterpolator
 
 import time
 
@@ -70,40 +71,81 @@ def GetValue(listInfo,chaine):
 ############################################################################################################################		 
 ############################################################################################################################		 
 def GetInfo(chem_xing, cheminTIF):
+	"""
+	Récupère les métadonnées d'une image GeoTIFF.
+	Version open source utilisant rasterio (chem_xing n'est plus utilisé mais conservé pour compatibilité).
 	
-	### récupérer les infos dans un flux
-	cmdinfo="%s -i %s  -n:stdout" % (chem_xing,cheminTIF)
-	pipe= os.popen(cmdinfo)
-	listInfo = pipe.readlines()
-	pipe.close()
-	
-	### initialisation des variables
-	PasX, PasY, projection, X_0, X_1, Y_0, Y_1 = 0, 0, 0, 0, 0, 0, 0 
-	phasage="HG"
-	
-	### récupération des données
-	PasX=float(GetValue(listInfo,"pas en X"))
-	PasY=float(GetValue(listInfo,"pas en Y"))
-	X_0=float(GetValue(listInfo,"position en X (GAUCHE)"))
-	Y_1=float(GetValue(listInfo,"position en Y (HAUT)"))
-	X_1=float(GetValue(listInfo,"position en X (DROITE)"))
-	Y_0=float(GetValue(listInfo,"position en Y (BAS)")) 
-	NbreCol=float(GetValue(listInfo,"nombre de colonnes"))
-	NbreLig=float(GetValue(listInfo,"nombre de lignes"))
-	if GetValue(listInfo,"GTModelTypeGeoKey"): GModel=int(GetValue(listInfo,"GTModelTypeGeoKey"))	  
-	else: GModel=-1
-	if GetValue(listInfo,"GTRasterTypeGeoKey"): GRaster=int(GetValue(listInfo,"GTRasterTypeGeoKey"))
-	else: GRaster=-1
-	if GetValue(listInfo,"code EPSG"): Projection=int(GetValue(listInfo,"code EPSG"))
-	else: Projection=-1
-	### traitement différent pour le phasage
-	#print('GetValue(listInfo,"CENTRE") >> ',GetValue(listInfo,"CENTRE"))
-	if  (not GetValue(listInfo,"CENTRE PIXEL")):
-		phasage="HG"
-	else: phasage="CP"
-	#print('phasage >> ',phasage)
+	Returns:
+		[PasX, PasY, Projection, X_0, X_1, Y_0, Y_1, phasage, NbreCol, NbreLig, GModel, GRaster]
+	"""
+	# Ouvrir l'image avec rasterio
+	with rasterio.open(cheminTIF, 'r') as src:
+		# Pas en X et Y (résolution)
+		transform = src.transform
+		PasX = abs(transform[0])  # pixel width
+		PasY = abs(transform[4])  # pixel height (généralement négatif, on prend la valeur absolue)
 		
-	return [PasX,PasY,Projection,X_0,X_1,Y_0,Y_1,phasage,NbreCol,NbreLig,GModel,GRaster] 
+		# Bounds (positions)
+		bounds = src.bounds
+		X_0 = bounds.left   # GAUCHE
+		X_1 = bounds.right   # DROITE
+		Y_0 = bounds.bottom  # BAS
+		Y_1 = bounds.top     # HAUT
+		
+		# Nombre de colonnes et lignes
+		NbreCol = float(src.width)
+		NbreLig = float(src.height)
+		
+		# Code EPSG / Projection
+		if src.crs is not None:
+			Projection = int(src.crs.to_epsg()) if src.crs.to_epsg() is not None else -1
+		else:
+			Projection = -1
+		
+		# GTModelTypeGeoKey et GTRasterTypeGeoKey
+		# Ces clés sont dans les tags GeoTIFF, généralement dans les tags de la bande
+		GModel = -1
+		GRaster = -1
+		# Essayer d'abord les tags du dataset
+		if hasattr(src, 'tags') and src.tags():
+			tags = src.tags()
+			if 'GTModelTypeGeoKey' in tags:
+				try:
+					GModel = int(tags['GTModelTypeGeoKey'])
+				except (ValueError, TypeError):
+					pass
+			if 'GTRasterTypeGeoKey' in tags:
+				try:
+					GRaster = int(tags['GTRasterTypeGeoKey'])
+				except (ValueError, TypeError):
+					pass
+		# Si pas trouvé, essayer les tags de la première bande
+		if (GModel == -1 or GRaster == -1) and hasattr(src, 'tags'):
+			try:
+				band_tags = src.tags(1)
+				if band_tags:
+					if 'GTModelTypeGeoKey' in band_tags and GModel == -1:
+						try:
+							GModel = int(band_tags['GTModelTypeGeoKey'])
+						except (ValueError, TypeError):
+							pass
+					if 'GTRasterTypeGeoKey' in band_tags and GRaster == -1:
+						try:
+							GRaster = int(band_tags['GTRasterTypeGeoKey'])
+						except (ValueError, TypeError):
+							pass
+			except:
+				pass
+		
+		# Phasage : déterminer si c'est "HG" (haut-gauche) ou "CP" (centre pixel)
+		phasage = "HG"  # Par défaut
+		if hasattr(src, 'tags') and src.tags():
+			# Vérifier les tags pour le phasage
+			tags = src.tags()
+			if 'AREA_OR_POINT' in tags and tags['AREA_OR_POINT'] == 'Point':
+				phasage = "CP"
+	
+	return [PasX, PasY, Projection, X_0, X_1, Y_0, Y_1, phasage, NbreCol, NbreLig, GModel, GRaster] 
 	
 #############################################################################################################################	
 def read_as_2D_float(filename,no_data):
@@ -186,6 +228,147 @@ def save_image_with_same_geometry(image, output_filename, src_filename):
 	# Utilisez les métadonnées copiées pour écrire l'image dans un fichier .tif
 	with rasterio.open(output_filename, 'w', **metadata) as dst:
 		dst.write(image, 1)  # Écrit l'image dans la première bande en assumant qu'il s'agit d'une image à une seule bande
+
+#############################################################################################################################	
+def interpolate_nodata_with_linearnd(chem_in, chem_out, no_data=-9999):
+	"""
+	Interpole les pixels nodata (valeur -9999) en utilisant LinearNDInterpolator de scipy.
+	
+	Args:
+		chem_in: Chemin vers l'image d'entrée avec des pixels nodata
+		chem_out: Chemin vers l'image de sortie avec les pixels nodata interpolés
+		no_data: Valeur nodata (par défaut -9999)
+	"""
+	# Supprimer le fichier de sortie s'il existe déjà pour garantir l'écrasement
+	if os.path.exists(chem_out):
+		try:
+			os.remove(chem_out)
+		except OSError:
+			pass  # Ignorer les erreurs si le fichier est verrouillé ou n'existe plus
+	
+	# Supprimer aussi les fichiers auxiliaires (.aux.xml) s'ils existent
+	chem_out_aux = chem_out + '.aux.xml'
+	if os.path.exists(chem_out_aux):
+		try:
+			os.remove(chem_out_aux)
+		except OSError:
+			pass
+	
+	# Lire l'image
+	with rasterio.open(chem_in, 'r') as src:
+		data = src.read(1).astype(np.float32)
+		metadata = src.meta.copy()
+	
+	# Identifier les pixels valides (non nodata) et les pixels nodata
+	mask_valid = (data != no_data) & ~np.isnan(data)
+	mask_nodata = ~mask_valid
+	
+	# Si aucun pixel nodata, copier simplement l'image
+	if not np.any(mask_nodata):
+		print("Aucun pixel nodata à interpoler, copie de l'image originale.")
+		with rasterio.open(chem_out, 'w', **metadata) as dst:
+			dst.write(data, 1)
+		return
+	
+	# Créer les coordonnées (ligne, colonne) pour tous les pixels
+	rows, cols = np.meshgrid(np.arange(data.shape[0]), np.arange(data.shape[1]), indexing='ij')
+	
+	# Coordonnées des pixels valides
+	points_valid = np.column_stack([rows[mask_valid], cols[mask_valid]])
+	values_valid = data[mask_valid]
+	
+	# Coordonnées des pixels nodata à interpoler
+	points_nodata = np.column_stack([rows[mask_nodata], cols[mask_nodata]])
+	
+	# Créer l'interpolateur
+	interpolator = LinearNDInterpolator(points_valid, values_valid)
+	
+	# Interpoler les valeurs pour les pixels nodata
+	interpolated_values = interpolator(points_nodata)
+	
+	# Créer une copie de l'image et remplacer les pixels nodata par les valeurs interpolées
+	result = data.copy()
+	result[mask_nodata] = interpolated_values
+	
+	# Gérer les cas où l'interpolation peut retourner NaN (hors du domaine convexe)
+	# Dans ce cas, on garde la valeur nodata originale
+	mask_nan_interp = np.isnan(interpolated_values)
+	if np.any(mask_nan_interp):
+		print(f"Attention: {np.sum(mask_nan_interp)} pixels nodata n'ont pas pu être interpolés (hors du domaine convexe).")
+		# Remplacer les NaN par la valeur nodata
+		result[mask_nodata][mask_nan_interp] = no_data
+	
+	# Sauvegarder l'image résultante
+	metadata['dtype'] = result.dtype
+	with rasterio.open(chem_out, 'w', **metadata) as dst:
+		dst.write(result, 1)
+	
+	print(f"Interpolation terminée: {np.sum(mask_nodata)} pixels nodata traités.")
+
+#############################################################################################################################	
+def apply_moving_average(chem_in, chem_out, window_size=50, no_data=-9999):
+	"""
+	Applique une moyenne sur une fenêtre glissante à l'image.
+	
+	Args:
+		chem_in: Chemin vers l'image d'entrée
+		chem_out: Chemin vers l'image de sortie
+		window_size: Taille de la fenêtre glissante (par défaut 50x50)
+		no_data: Valeur nodata (par défaut -9999)
+	"""
+	# Supprimer le fichier de sortie s'il existe déjà pour garantir l'écrasement
+	if os.path.exists(chem_out):
+		try:
+			os.remove(chem_out)
+		except OSError:
+			pass
+	
+	# Supprimer aussi les fichiers auxiliaires (.aux.xml) s'ils existent
+	chem_out_aux = chem_out + '.aux.xml'
+	if os.path.exists(chem_out_aux):
+		try:
+			os.remove(chem_out_aux)
+		except OSError:
+			pass
+	
+	# Lire l'image
+	with rasterio.open(chem_in, 'r') as src:
+		data = src.read(1).astype(np.float32)
+		metadata = src.meta.copy()
+	
+	# Créer un masque pour les pixels nodata
+	mask_nodata = (data == no_data) | np.isnan(data)
+	
+	# Créer une copie des données en float64 pour les calculs
+	data_float = data.astype(np.float64)
+	
+	# Remplacer les nodata par 0 pour le calcul de la somme
+	data_sum = data_float.copy()
+	data_sum[mask_nodata] = 0.0
+	
+	# Créer un masque de poids (1 pour valide, 0 pour nodata)
+	weights = (~mask_nodata).astype(np.float64)
+	
+	# Calculer la somme et le nombre de pixels valides dans chaque fenêtre
+	sum_window = uniform_filter(data_sum, size=window_size, mode='constant', cval=0.0)
+	count_window = uniform_filter(weights, size=window_size, mode='constant', cval=0.0)
+	
+	# Calculer la moyenne uniquement là où il y a des pixels valides
+	# Éviter la division par zéro
+	result = np.where(count_window > 0, sum_window / count_window, no_data)
+	
+	# Conserver les nodata originaux (si un pixel était nodata, il reste nodata)
+	result[mask_nodata] = no_data
+	
+	# Convertir en float32 pour la sauvegarde
+	result = result.astype(np.float32)
+	
+	# Sauvegarder l'image résultante
+	metadata['dtype'] = result.dtype
+	with rasterio.open(chem_out, 'w', **metadata) as dst:
+		dst.write(result, 1)
+	
+	print(f"Moyenne sur fenêtre glissante {window_size}x{window_size} terminée.")
 
 #################################################################################################### 
 ### calcule le nombre de dalles en X et en Y en fonction des paramètres de chantier
@@ -809,6 +992,7 @@ if __name__ == '__main__':
 		parser.add_argument("-pad", type=int, default=50, help="Pad / Recouvrement entre tuiles")	
 		parser.add_argument("-RepTra", type=str, help="Répertoire de Travail")
 		parser.add_argument("-cpu", type=int, help="Nombre de CPU diponibles")
+		parser.add_argument("-winavg", type=int, default=50, help="Taille de la fenêtre glissante pour la moyenne (par défaut 50x50)")
 		
 		args = parser.parse_args(sys.argv[1:])
 		#
@@ -831,6 +1015,7 @@ if __name__ == '__main__':
 		#print(iNbreCPU)
 		iTailleparcelle=args.tile
 		iTailleRecouvrement=args.pad
+		winavg_size=args.winavg
 		dl=demiwinsize_lig
 		dc=demiwinsize_col
 		
@@ -855,24 +1040,17 @@ if __name__ == '__main__':
 		chem_out_tmp = chem_out.replace('.tif', '_tmp.tif')
 		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra)
 		
-		print('0')
-		#### Post-traitement 1: Remplacement des valeurs nodata par -9999
-		chem_out_clean = chem_out.replace('.tif', '_clean.tif')
-		cmd_clean = "%s -i %s -e'I1.1!=I1.1?-9999:I1.1' -o %s" % (chem_xing, chem_out_tmp, chem_out_clean)
-		print("Post-traitement 1: Remplacement des nodata par -9999...")
-		os.system(cmd_clean)
-		
-		#### Post-traitement 2: Bouchage des zones avec no data
+		#### Post-traitement 2: Bouchage des zones avec no data (interpolation avec LinearNDInterpolator)
 		chem_out_clean_bouchage = chem_out.replace('.tif', '_clean_bouchage.tif')
-		cmd_bouchage = "%s -i %s -FB:2:C:50,1:1:50:1 -o %s -EM=-9999" % (chem_xing, chem_out_clean, chem_out_clean_bouchage)
-		print("Post-traitement 2: Bouchage des zones nodata...")
-		os.system(cmd_bouchage)
+		print("Post-traitement 2: Interpolation des pixels nodata avec LinearNDInterpolator...")
+		interpolate_nodata_with_linearnd(chem_out_tmp, chem_out_clean_bouchage, no_data)
+
+
 		
-		#### Post-traitement 3: Moyenne sur fenêtre glissante 50x50
+		#### Post-traitement 3: Moyenne sur fenêtre glissante (open source)
 		# Le fichier final utilise le nom spécifié dans --out
-		cmd_moyenne = "%s -i %s -Xm:50:50 -o %s" % (chem_xing, chem_out_clean_bouchage, chem_out)
-		print("Post-traitement 3: Moyenne fenêtre glissante 50x50...")
-		os.system(cmd_moyenne)
+		print(f"Post-traitement 3: Moyenne fenêtre glissante {winavg_size}x{winavg_size}...")
+		apply_moving_average(chem_out_clean_bouchage, chem_out, window_size=winavg_size, no_data=no_data)
 		
 		print("Fichier final généré: %s" % chem_out)
 		

@@ -34,28 +34,6 @@ from tqdm import tqdm
 
 import signal
 
-# Chemin vers xingng - peut être défini via variable d'environnement XINGNG_PATH
-# ou utilise le chemin par défaut
-# _DEFAULT_XINGNG_PATH = '/Volumes/ALI_Serveur/DEPLOIEMENT/bin_linux/xingng'
-
-_DEFAULT_XINGNG_PATH = os.path.expanduser('~/xingng')
-
-def get_xingng_path():
-    """Récupère le chemin vers xingng et vérifie qu'il est accessible."""
-    chem_xing = os.environ.get('XINGNG_PATH', _DEFAULT_XINGNG_PATH)
-    chem_xing = os.path.expanduser(chem_xing)  # Assure l'expansion du ~ même via variable d'env
-
-    # Vérification que xingng existe et est exécutable
-    if not os.path.isfile(chem_xing):
-        raise FileNotFoundError(
-            f"xingng non trouvé à: {chem_xing}.\n"
-            f"Définissez la variable d'environnement XINGNG_PATH ou modifiez le chemin par défaut dans le code."
-        )
-    if not os.access(chem_xing, os.X_OK):
-        raise PermissionError(f"xingng n'est pas exécutable: {chem_xing}")
-    
-    return chem_xing
-
 # Outils OTB (non utilisés actuellement dans le code, commentés pour référence)
 # otbcli_ConnectedComponentSegmentation='/home/OTB/OTB-7.4.0-Linux64/bin/otbcli_ConnectedComponentSegmentation'
 # otbcli_BinaryMorphologicalOperation='/home/OTB/OTB-7.4.0-Linux64/bin/otbcli_BinaryMorphologicalOperation'
@@ -70,10 +48,10 @@ def GetValue(listInfo,chaine):
 			
 ############################################################################################################################		 
 ############################################################################################################################		 
-def GetInfo(chem_xing, cheminTIF):
+def GetInfo(cheminTIF):
 	"""
 	Récupère les métadonnées d'une image GeoTIFF.
-	Version open source utilisant rasterio (chem_xing n'est plus utilisé mais conservé pour compatibilité).
+	Version open source utilisant rasterio.
 	
 	Returns:
 		[PasX, PasY, Projection, X_0, X_1, Y_0, Y_1, phasage, NbreCol, NbreLig, GModel, GRaster]
@@ -211,7 +189,7 @@ def save_ABSOLUTE_image_with_same_geometry(image, output_filename, src_filename)
     metadata['height'], metadata['width'] = abs_image.shape
     metadata['dtype'] = abs_image.dtype  # Assurez-vous que le type de données correspond à l'image de sortie
     
-    # Utilisez lechem_xings métadonnées copiées pour écrire l'image dans un fichier .tif
+    # Utilisez les métadonnées copiées pour écrire l'image dans un fichier .tif
     with rasterio.open(output_filename, 'w', **metadata) as dst:
         dst.write(abs_image, 1)  # Écrit l'image dans la première bande en assumant qu'il s'agit d'une image à une seule bande
         
@@ -717,10 +695,9 @@ def assemble_horizontal_OLD(image_paths, output_path):
 			src.close()
 
 #################################################################################################### 	
-def Make_Assemblage_FINAL(chem_out, chem_xing, NbreDalleX, NbreDalleY, RepTra):
+def Make_Assemblage_FINAL(chem_out, NbreDalleX, NbreDalleY, RepTra):
 	"""
-	Assemble les dalles en utilisant rasterio au lieu de xing.
-	Note: chem_xing n'est plus utilisé mais conservé pour compatibilité de signature.
+	Assemble les dalles en utilisant rasterio (version open source).
 	"""
 	####################################################################################################################################################
 	## on raboute tout d'abord 2 dalles côte à côte (en X)	   #########################################################################################
@@ -983,7 +960,6 @@ def diff_2_mask_quality(args):
 def create_negative_image(chem_in, chem_out, no_data=-9999):
 	"""
 	Crée une version "négative" de l'image : remplace les pixels > 0 par no_data.
-	Équivalent à xing -e'I1.1>0?%s:I1.1'
 	
 	Args:
 		chem_in: Chemin vers l'image d'entrée
@@ -1027,7 +1003,7 @@ def DoParallel(RepTra, NbreDalleX, NbreDalleY, dl, no_data, percentile, iNbreCPU
 			chem_in_dalle_NEG=os.path.join(RepDalleXY,"IN_%s_%s_NEG.tif"%(x,y))
 			chem_out_dalle=os.path.join(RepDalleXY,"MASK_%s_%s.tif"%(x,y))
 			#
-			# Créer la version négative (remplace xing -e'I1.1>0?%s:I1.1')
+			# Créer la version négative 
 			create_negative_image(chem_in_dalle, chem_in_dalle_NEG, no_data)
 			#
 			args=(chem_in_dalle_NEG, chem_out_dalle, dl, no_data, percentile)
@@ -1089,10 +1065,6 @@ if __name__ == '__main__':
 		
 		args = parser.parse_args(sys.argv[1:])
 		#
-		# Initialisation du chemin vers xingng (vérifie l'existence et les permissions)
-		chem_xing = get_xingng_path()
-		print(f"Utilisation de xingng: {chem_xing}")
-		#
 		chem_in=args.diff
 		chem_out=args.out
 		no_data=args.no
@@ -1113,7 +1085,7 @@ if __name__ == '__main__':
 		dc=demiwinsize_col
 		
 		### Découpage
-		infos=GetInfo(chem_xing, chem_in)
+		infos=GetInfo(chem_in)
 		
 		NbreCol=infos[8]
 		NbreLig=infos[9]
@@ -1128,10 +1100,10 @@ if __name__ == '__main__':
 		#Traitement/Calcul en parallèle
 		DoParallel(RepTra, NbreDalleX, NbreDalleY, dl, no_data, percentile, iNbreCPU)
 		
-		#### Assemblage final - avec xingng = A REMPLACER !
+		#### Assemblage final (version open source)
 		# Le fichier d'assemblage est temporaire (fini par _tmp.tif)
 		chem_out_tmp = chem_out.replace('.tif', '_tmp.tif')
-		Make_Assemblage_FINAL(chem_out_tmp, chem_xing, NbreDalleX, NbreDalleY, RepTra)
+		Make_Assemblage_FINAL(chem_out_tmp, NbreDalleX, NbreDalleY, RepTra)
 		
 		#### Post-traitement 2: Bouchage des zones avec no data (interpolation avec LinearNDInterpolator)
 		chem_out_clean_bouchage = chem_out.replace('.tif', '_clean_bouchage.tif')

@@ -6,14 +6,6 @@ Ce dépôt contient un script Python (`make_quality_great_again.py`) qui
 calcule un **masque de qualité** à partir d'une **différence DSM/DTM**
 (par exemple **MNS - MNT**).
 
-L'algorithme :
-
-1.  découpe l'image en **tuiles**
-2.  traite chaque tuile **en parallèle**
-3.  **recoud les résultats**
-4.  **interpole les trous (NoData)**
-5.  applique un **lissage final**
-
 ------------------------------------------------------------------------
 
 # Fonctionnalités principales
@@ -36,111 +28,73 @@ L'algorithme :
 
 ------------------------------------------------------------------------
 
-# Dépendances
+# Installation typique
 
--   Python 3
--   numpy
--   rasterio
--   scipy
--   tqdm
--   osgeo (GDAL)
-
-### Installation typique
+Créer l'environnement conda et lancer l'outil :
 
 ``` bash
-pip install numpy rasterio scipy tqdm
-sudo apt install gdal-bin python3-gdal
+conda env create -f mqga_env.yml
+conda activate mqga_env
+
+python3 make_quality_great_again.py --help
 ```
 
-(adapter selon votre OS)
+Vous devriez obtenir ceci :
+
+    usage: make_quality_great_again.py [-h] [-diff DIFF] [-out OUT] [-no NO] [-per PER] [-demiwinl DEMIWINL] [-demiwinc DEMIWINC] [-tile TILE] [-pad PAD] [-RepTra REPTRA] [-cpu CPU]
+                                       [-winavg WINAVG] [-interp {griddata,idw,idw_old,window,linearnd,fast,hybrid}] [-clean]
+
+    MAKE QUALITY GREAT AGAIN ALL ZONE - Version Spatialisée & Parallélisée
+
+    options:
+      -h, --help            show this help message and exit
+      -diff DIFF            Différence DSM/DTM en entrée
+      -out OUT              Masque de Qualité en sortie
+      -no NO                Valeur de No Data
+      -per PER              Valeur de percentile
+      -demiwinl DEMIWINL    Demie-taille en ligne de la fenêtre d'analyse
+      -demiwinc DEMIWINC    Demie-taille en colonne de la fenêtre d'analyse
+      -tile TILE            Tile / Taille de la tuile
+      -pad PAD              Pad / Recouvrement entre tuiles
+      -RepTra REPTRA        Répertoire de Travail
+      -cpu CPU              Nombre de CPU diponibles
+      -winavg WINAVG        Taille de la fenêtre glissante pour la moyenne (par défaut 50x50)
+      -interp {griddata,idw,idw_old,window,linearnd,fast,hybrid}
+                            Méthode d'interpolation pour les pixels nodata (défaut: idw - optimisé et parallélisé, hybrid = méthode hybride xingng)
+      -clean                Supprimer le contenu du répertoire temporaire s'il existe déjà
 
 ------------------------------------------------------------------------
 
-# Utilisation
-
-### Exécution de base
-
-``` bash
-python3 make_quality_great_again.py \
--diff chemin/vers/diff_MNS_MNT.tif \
--out chemin/vers/masque_qualite.tif \
--RepTra chemin/vers/repertoire_temporaire \
--cpu 8 \
--interp hybrid
-```
-
-------------------------------------------------------------------------
-
-# Arguments principaux
-
-  Argument    Description
-  ----------- --------------------------------------------
-  `-diff`     Raster d'entrée (différence DSM/DTM)
-  `-out`      Raster de sortie (masque de qualité final)
-  `-RepTra`   Répertoire de travail temporaire
-  `-cpu`      Nombre de processus parallèles
-
-Le répertoire temporaire contient :
-
--   les **tuiles**
--   les **fichiers intermédiaires**
-
-------------------------------------------------------------------------
-
-# Paramètres optionnels
-
-  Argument      Description                                     Défaut
-  ------------- ----------------------------------------------- -----------------
-  `-no`         Valeur NoData                                   -9999
-  `-per`        Percentile utilisé pour le calcul local         0.05
-  `-demiwinl`   Demi-taille fenêtre ligne                       50
-  `-demiwinc`   Demi-taille fenêtre colonne                     50
-  `-tile`       Taille des tuiles                               500 px
-  `-pad`        Recouvrement entre tuiles                       50 px
-  `-winavg`     Fenêtre moyenne glissante finale                50
-  `-interp`     Méthode interpolation NoData                    voir ci-dessous
-  `-clean`      Nettoie le répertoire temporaire au lancement   option
-
-------------------------------------------------------------------------
-
-# Méthodes d'interpolation disponibles
-
-    griddata
-    idw
-    idw_old
-    window
-    linearnd
-    fast
-    hybrid
+✈️ **Et le voyage peut commencer !**
 
 ------------------------------------------------------------------------
 
 # Méthode hybride (`-interp hybrid`)
 
-Implémente en Python un équivalent de :
+La méthode `hybrid` implémente en Python un équivalent de :
 
     xingng -FB:2:C:50,1:1:50:1 -EM=-9999
 
-### Principe
+## Principe
 
 1.  Identification des **trous connexes (zones NoData)**
 2.  Détection des **pixels de bord du trou** (connexité 4)
 3.  Pour chaque trou :
 
-#### Étape 1 --- Calcul d'une constante `V_calc`
+### Étape 1 --- Calcul d'une constante `V_calc`
 
 -   récupération des pixels de bord
 -   suppression des **50 % plus petites valeurs**
 -   prise du **minimum des restantes**
 
-#### Étape 2 --- Interpolation locale
+### Étape 2 --- Interpolation locale
 
 Interpolation **IDW sur les pixels de bord**
 
 -   rayon : **50 pixels**
 -   poids : **1**
 
-#### Étape 3 --- Combinaison des deux
+### Étape 3 --- Combinaison des deux
 
 Selon la **distance au bord du trou** :
 
@@ -149,37 +103,20 @@ Selon la **distance au bord du trou** :
   proche du bord   interpolation locale
   centre du trou   constante `V_calc`
 
-Cette méthode permet :
-
--   un **remplissage robuste des grands trous**
--   tout en restant **relativement rapide**
+Cette méthode remplit mieux les grands trous tout en restant
+**raisonnablement rapide**.
 
 ------------------------------------------------------------------------
 
 # Organisation du traitement
 
-1.  Lecture des métadonnées de l'image\
-    `GetInfo`
-
-2.  Calcul du nombre de tuiles\
-    `CalculNombreDallesXY`
-
-3.  Découpage en tuiles\
-    `MakeDecoupage`
-
-4.  Calcul du masque par tuile (parallèle)\
-    `DoParallel`
-
-5.  Assemblage des tuiles\
-    `Make_Assemblage_FINAL`
-
-6.  Interpolation des NoData\
-    `interpolate_nodata_*`
-
-(selon `-interp`)
-
-7.  Lissage final\
-    `apply_moving_average`
+1.  Lecture des métadonnées de l'image (`GetInfo`)
+2.  Calcul du nombre de tuiles (`CalculNombreDallesXY`)
+3.  Découpage en tuiles (`MakeDecoupage`)
+4.  Calcul du masque par tuile en parallèle (`DoParallel`)
+5.  Assemblage final des tuiles (`Make_Assemblage_FINAL`)
+6.  Interpolation des NoData (`interpolate_nodata_*`)
+7.  Lissage final (`apply_moving_average`)
 
 ------------------------------------------------------------------------
 
@@ -187,11 +124,11 @@ Cette méthode permet :
 
 Code ouvert pour **usage interne et expérimental autour de GEMAUT**.
 
-Les contributions sont bienvenues :
+Contributions bienvenues :
 
 -   nouvelles méthodes d'interpolation
 -   optimisation CPU / mémoire
 -   amélioration de la CLI
 -   documentation
 
-Merci de **documenter clairement toute nouvelle option ou méthode**.
+Merci de **documenter clairement les ajouts ou nouvelles options**.

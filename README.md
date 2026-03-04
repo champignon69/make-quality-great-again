@@ -69,11 +69,11 @@ Vous devriez obtenir ceci :
 
 ------------------------------------------------------------------------
 
-# Méthode hybride (`-interp hybrid`)
+# Méthode hybride (`-interp hybrid`) pour le bouchage de trous (recommnadée)
 
 La méthode `hybrid` implémente en Python un équivalent de :
-
     xingng -FB:2:C:50,1:1:50:1 -EM=-9999
+(Pour celles et ceux qui ont  la réf)
 
 ## Principe
 
@@ -120,15 +120,9 @@ Cette méthode remplit mieux les grands trous tout en restant
 
 ------------------------------------------------------------------------
 
-# Licence et contributions
+## Licence
 
-Code ouvert pour **usage interne et expérimental autour de GEMAUT**.
+Ce projet est sous licence [LICENSE](LICENSE).
 
-Contributions bienvenues :
 
--   nouvelles méthodes d'interpolation
--   optimisation CPU / mémoire
--   amélioration de la CLI
--   documentation
 
-Merci de **documenter clairement les ajouts ou nouvelles options**.

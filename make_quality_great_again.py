@@ -20,7 +20,7 @@ from rasterio.merge import merge
 from rasterio.windows import from_bounds
 import imageio
 import scipy as sp
-import scipy.misc as sm
+#import scipy.misc as sm
 import scipy.sparse.linalg as ssl
 from scipy.ndimage import generic_filter, uniform_filter, label, binary_dilation
 from scipy.interpolate import LinearNDInterpolator, griddata

@@ -4,7 +4,6 @@
 
 Ce dépôt contient un script Python (`make_quality_great_again.py`) qui
 calcule un **masque de qualité** à partir d'une **différence DSM/DTM**
-(par exemple **MNS - MNT**)
 
 ------------------------------------------------------------------------
 
